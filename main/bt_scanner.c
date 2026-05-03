@@ -1,162 +1,256 @@
 #include "bt_scanner.h"
-#include "config.h"
 #include "esp_bt.h"
 #include "esp_gap_ble_api.h"
 #include "esp_bt_main.h"
 #include "esp_log.h"
-#include "mbedtls/sha256.h"
 #include <string.h>
-#include <time.h>
+#include <math.h>
 
-static const char *TAG = "BLE_Scanner";
+static const char *TAG = "BLE";
 
-#define MAX_BLE_DEVICES 500
-static ble_device_t ble_device_cache[MAX_BLE_DEVICES];
-static uint16_t ble_device_count = 0;
+#define RSSI_THRESHOLD  -45    // ~0.5 m
+#define TX_POWER_NONE   127    // sentinel — device did not advertise TX power
 
-// Hash MAC address
-static void hash_mac(const uint8_t *mac, uint8_t *hash_output) {
-    mbedtls_sha256_context ctx;
-    uint8_t combined[6 + strlen(MAC_HASH_SALT)];
+// ── Service UUID descriptions ─────────────────────────────────────────────────
 
-    memcpy(combined, mac, 6);
-    memcpy(combined + 6, MAC_HASH_SALT, strlen(MAC_HASH_SALT));
-
-    mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0);
-    mbedtls_sha256_update(&ctx, combined, sizeof(combined));
-    uint8_t full_hash[32];
-    mbedtls_sha256_finish(&ctx, full_hash);
-    mbedtls_sha256_free(&ctx);
-
-    memcpy(hash_output, full_hash, 16);
-}
-
-// Find BLE device in cache
-static ble_device_t* find_ble_device(const uint8_t *mac_hash) {
-    for (uint16_t i = 0; i < ble_device_count; i++) {
-        if (memcmp(ble_device_cache[i].mac_hash, mac_hash, 16) == 0) {
-            return &ble_device_cache[i];
-        }
-    }
-    return NULL;
-}
-
-// Update BLE device cache
-static void update_ble_cache(const uint8_t *mac, int8_t rssi) {
-    uint8_t mac_hash[16];
-    hash_mac(mac, mac_hash);
-
-    ble_device_t *device = find_ble_device(mac_hash);
-    uint32_t now = (uint32_t)time(NULL);
-
-    if (device != NULL) {
-        device->rssi = rssi;
-        device->timestamp = now;
-        device->is_active = 1;
-    } else {
-        if (ble_device_count < MAX_BLE_DEVICES) {
-            memcpy(ble_device_cache[ble_device_count].mac_hash, mac_hash, 16);
-            ble_device_cache[ble_device_count].rssi = rssi;
-            ble_device_cache[ble_device_count].timestamp = now;
-            ble_device_cache[ble_device_count].is_active = 1;
-            ble_device_count++;
-
-            ESP_LOGI(TAG, "New BLE device: %02x%02x... RSSI: %d dBm (total: %d)",
-                     mac_hash[0], mac_hash[1], rssi, ble_device_count);
-        }
+static const char *service_uuid_name(uint16_t uuid) {
+    switch (uuid) {
+        case 0x1800: return "Generic Access";
+        case 0x1801: return "Generic Attribute";
+        case 0x180A: return "Device Information";
+        case 0x180D: return "Heart Rate Monitor";
+        case 0x180F: return "Battery";
+        case 0x1812: return "HID (keyboard / mouse / gamepad)";
+        case 0x1816: return "Cycling Speed & Cadence";
+        case 0x1818: return "Cycling Power";
+        case 0x181A: return "Environmental Sensing";
+        case 0xFE9F: return "Google Fast Pair  →  Android phone";
+        case 0xFD5A: return "Google Nearby Share";
+        case 0xFEAA: return "Eddystone Beacon";
+        case 0xFEBE: return "Tile Tracker";
+        case 0xFD6F: return "COVID-19 Exposure Notification";
+        case 0xFE95: return "Xiaomi";
+        case 0xFE8A: return "Apple ANCS";
+        default:     return NULL;
     }
 }
 
-// GAP callback for scan results
-static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
-    switch (event) {
-        case ESP_GAP_BLE_SCAN_RESULT_EVT: {
-            esp_ble_gap_cb_param_t *scan_result = (esp_ble_gap_cb_param_t *)param;
+// ── Apple manufacturer-specific subtypes ─────────────────────────────────────
 
-            if (scan_result->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
-                int8_t rssi = scan_result->scan_rst.rssi;
+static const char *apple_subtype_name(uint8_t type) {
+    switch (type) {
+        case 0x02: return "iBeacon";
+        case 0x05: return "AirDrop";
+        case 0x07: return "AirPods";
+        case 0x09: return "AirPlay Target";
+        case 0x0A: return "AirPlay Source";
+        case 0x0C: return "Handoff  (iPhone / Mac continuity)";
+        case 0x0F: return "Nearby Action  (AirDrop / Siri)";
+        case 0x10: return "Nearby Info  (iPhone status)";
+        case 0x12: return "Find My";
+        case 0x15: return "Proximity Pairing  (AirPods)";
+        case 0x1E: return "HomeKit";
+        default:   return "Apple (unknown subtype)";
+    }
+}
 
-                // Filter weak signals
-                if (rssi < MIN_RSSI) {
-                    break;
-                }
+// ── Advertising payload parser ────────────────────────────────────────────────
+// Returns the TX Power found in this payload, or TX_POWER_NONE if absent.
 
-                uint8_t *bda = scan_result->scan_rst.bda;
-                update_ble_cache(bda, rssi);
+static int8_t parse_adv_payload(const uint8_t *data, uint8_t len, const char *label) {
+    if (len == 0) return TX_POWER_NONE;
+
+    int8_t tx_power = TX_POWER_NONE;
+    ESP_LOGI(TAG, "  [%s]", label);
+
+    uint8_t i = 0;
+    while (i < len) {
+        uint8_t ad_len = data[i];
+        if (ad_len == 0 || (i + ad_len) >= len) break;
+
+        uint8_t        ad_type = data[i + 1];
+        const uint8_t *val     = &data[i + 2];
+        uint8_t        val_len = ad_len - 1;
+
+        switch (ad_type) {
+
+            case 0x01: {
+                uint8_t f = val[0];
+                ESP_LOGI(TAG, "    Flags: 0x%02x%s%s%s", f,
+                    (f & 0x02) ? " [General Discoverable]" : "",
+                    (f & 0x01) ? " [Limited Discoverable]" : "",
+                    (f & 0x04) ? " [BR/EDR Not Supported]" : "");
+                break;
             }
-            break;
+
+            case 0x08:
+            case 0x09: {
+                char name[32] = {0};
+                memcpy(name, val, val_len < 31 ? val_len : 31);
+                ESP_LOGI(TAG, "    Name: \"%s\"", name);
+                break;
+            }
+
+            case 0x0A:
+                tx_power = (int8_t)val[0];
+                ESP_LOGI(TAG, "    TX Power: %d dBm", tx_power);
+                break;
+
+            case 0x02:
+            case 0x03:
+                for (int j = 0; j + 1 < val_len; j += 2) {
+                    uint16_t uuid = val[j] | (val[j + 1] << 8);
+                    const char *name = service_uuid_name(uuid);
+                    if (name)
+                        ESP_LOGI(TAG, "    Service UUID 0x%04x  →  %s", uuid, name);
+                    else
+                        ESP_LOGI(TAG, "    Service UUID 0x%04x", uuid);
+                }
+                break;
+
+            case 0x06:
+            case 0x07:
+                if (val_len >= 16)
+                    ESP_LOGI(TAG,
+                        "    Service UUID 128-bit: "
+                        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                        val[15],val[14],val[13],val[12],
+                        val[11],val[10],val[9], val[8],
+                        val[7], val[6], val[5], val[4],
+                        val[3], val[2], val[1], val[0]);
+                break;
+
+            case 0x16: {
+                if (val_len < 2) break;
+                uint16_t uuid = val[0] | (val[1] << 8);
+                const char *name = service_uuid_name(uuid);
+                if (name)
+                    ESP_LOGI(TAG, "    Service Data 0x%04x  →  %s", uuid, name);
+                else
+                    ESP_LOGI(TAG, "    Service Data 0x%04x", uuid);
+                break;
+            }
+
+            case 0x19: {
+                uint16_t app = val[0] | (val[1] << 8);
+                const char *desc =
+                    app == 0x0040 ? "Phone"             :
+                    app == 0x0041 ? "Computer"          :
+                    app == 0x00C0 ? "Watch"             :
+                    app == 0x00C1 ? "Sports Watch"      :
+                    app == 0x0180 ? "Heart Rate Sensor" :
+                    app == 0x0300 ? "Hearing Aid"       :
+                    app == 0x0340 ? "Speaker"           :
+                    app == 0x03C0 ? "Cycling Computer"  : "Other";
+                ESP_LOGI(TAG, "    Appearance: 0x%04x  →  %s", app, desc);
+                break;
+            }
+
+            case 0xFF: {
+                if (val_len < 2) break;
+                uint16_t company = val[0] | (val[1] << 8);
+
+                if (company == 0x004C) {
+                    // Apple — decode subtype
+                    if (val_len >= 3) {
+                        uint8_t subtype = val[2];
+                        ESP_LOGI(TAG, "    Apple  →  %s", apple_subtype_name(subtype));
+
+                        // Nearby Info: decode iPhone screen / lock state
+                        if (subtype == 0x10 && val_len >= 5) {
+                            uint8_t status = val[4];
+                            ESP_LOGI(TAG, "      Screen: %s   Locked: %s",
+                                (status & 0x40) ? "On"  : "Off",
+                                (status & 0x20) ? "No"  : "Yes");
+                        }
+                    }
+                } else {
+                    const char *vendor =
+                        company == 0x00E0 ? "Google"    :
+                        company == 0x0006 ? "Microsoft" :
+                        company == 0x0075 ? "Samsung"   :
+                        company == 0x0310 ? "Fitbit"    :
+                        company == 0x0499 ? "Ruuvi"     :
+                        company == 0x0059 ? "Nordic"    : "Unknown";
+                    char hex[48] = {0};
+                    for (int j = 2; j < val_len && j < 16; j++)
+                        snprintf(hex + (j - 2) * 3, 4, "%02x ", val[j]);
+                    ESP_LOGI(TAG, "    Manufacturer: 0x%04x (%s)  data: %s", company, vendor, hex);
+                }
+                break;
+            }
+
+            default:
+                ESP_LOGI(TAG, "    AD type 0x%02x  len: %d", ad_type, val_len);
+                break;
         }
 
-        case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
-            ESP_LOGI(TAG, "BLE scan stopped");
-            break;
+        i += 1 + ad_len;
+    }
 
-        default:
-            break;
+    return tx_power;
+}
+
+// ── GAP event handler ─────────────────────────────────────────────────────────
+
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    if (event != ESP_GAP_BLE_SCAN_RESULT_EVT) return;
+    if (param->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) return;
+
+    int8_t rssi = param->scan_rst.rssi;
+    if (rssi < RSSI_THRESHOLD) return;
+
+    uint8_t *a        = param->scan_rst.bda;
+    uint8_t  adv_len  = param->scan_rst.adv_data_len;
+    uint8_t  rsp_len  = param->scan_rst.scan_rsp_len;
+    uint8_t  atype    = param->scan_rst.ble_addr_type;
+
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "MAC: %02x:%02x:%02x:%02x:%02x:%02x  [%s]  RSSI: %d dBm",
+        a[0], a[1], a[2], a[3], a[4], a[5],
+        atype == BLE_ADDR_TYPE_PUBLIC ? "Public" :
+        atype == BLE_ADDR_TYPE_RANDOM ? "Random" : "Other",
+        rssi);
+
+    int8_t tx_adv = parse_adv_payload(param->scan_rst.ble_adv, adv_len, "Advertisement");
+    int8_t tx_rsp = parse_adv_payload(param->scan_rst.ble_adv + adv_len, rsp_len, "Scan Response");
+
+    int8_t tx_power = (tx_adv != TX_POWER_NONE) ? tx_adv : tx_rsp;
+    if (tx_power != TX_POWER_NONE) {
+        float dist = powf(10.0f, (float)(tx_power - rssi) / 20.0f);
+        ESP_LOGI(TAG, "  Est. distance: %.2f m  (TX %d dBm / RSSI %d dBm)", dist, tx_power, rssi);
     }
 }
+
+// ── Public API ────────────────────────────────────────────────────────────────
 
 void ble_scanner_init(void) {
-    // Initialize Bluetooth controller
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
-
-    // Initialize Bluedroid stack
     ESP_ERROR_CHECK(esp_bluedroid_init());
     ESP_ERROR_CHECK(esp_bluedroid_enable());
-
-    // Register GAP callback
     ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_event_handler));
-
-    ESP_LOGI(TAG, "BLE scanner initialized");
+    ESP_LOGI(TAG, "BLE scanner ready  (RSSI >= %d dBm  ~0.5 m)", RSSI_THRESHOLD);
 }
 
 void ble_scanner_start(void) {
-    // Configure scan parameters
     esp_ble_scan_params_t scan_params = {
-        .scan_type = BLE_SCAN_TYPE_ACTIVE,
-        .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+        .scan_type          = BLE_SCAN_TYPE_ACTIVE,
+        .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
         .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
-        .scan_interval = 0x50,  // 50ms
-        .scan_window = 0x30,    // 30ms
-        .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE
+        .scan_interval      = 0x50,
+        .scan_window        = 0x30,
+        .scan_duplicate     = BLE_SCAN_DUPLICATE_ENABLE,
     };
-
     ESP_ERROR_CHECK(esp_ble_gap_set_scan_params(&scan_params));
-    ESP_ERROR_CHECK(esp_ble_gap_start_scanning(BLE_SCAN_INTERVAL));
-
-    ESP_LOGI(TAG, "BLE scanner started");
+    ESP_ERROR_CHECK(esp_ble_gap_start_scanning(0));
+    ESP_LOGI(TAG, "BLE scanning started");
 }
 
 void ble_scanner_stop(void) {
     ESP_ERROR_CHECK(esp_ble_gap_stop_scanning());
 }
 
-uint16_t ble_scanner_get_device_count(void) {
-    ble_scanner_clean_expired();
-
-    uint16_t count = 0;
-    for (uint16_t i = 0; i < ble_device_count; i++) {
-        if (ble_device_cache[i].is_active) {
-            count++;
-        }
-    }
-    return count;
-}
-
-void ble_scanner_clean_expired(void) {
-    uint32_t now = (uint32_t)time(NULL);
-    uint16_t active_count = 0;
-
-    for (uint16_t i = 0; i < ble_device_count; i++) {
-        if ((now - ble_device_cache[i].timestamp) > MAC_TTL_SECONDS) {
-            ble_device_cache[i].is_active = 0;
-        } else {
-            active_count++;
-        }
-    }
-
-    ESP_LOGI(TAG, "BLE cache: %d active, %d expired", active_count, ble_device_count - active_count);
-}
+uint16_t ble_scanner_get_device_count(void) { return 0; }
+void ble_scanner_clean_expired(void) {}

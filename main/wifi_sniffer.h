@@ -4,6 +4,21 @@
 #include <stdint.h>
 #include "esp_wifi_types.h"
 
+// IEEE 802.11 MAC header (not exposed in newer ESP-IDF public headers)
+typedef struct {
+    uint8_t frame_ctrl[2];
+    uint8_t duration[2];
+    uint8_t addr1[6];   // receiver
+    uint8_t addr2[6];   // transmitter / source
+    uint8_t addr3[6];   // BSSID / filtering address
+    uint8_t seq_ctrl[2];
+} wifi_ieee80211_mac_hdr_t;
+
+typedef struct {
+    wifi_ieee80211_mac_hdr_t hdr;
+    uint8_t payload[0];
+} wifi_ieee80211_packet_t;
+
 // Device entry in cache
 typedef struct {
     uint8_t mac_hash[16];  // Hashed MAC address

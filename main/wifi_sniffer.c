@@ -94,7 +94,7 @@ static void wifi_sniffer_packet_handler(void *buff, wifi_promiscuous_pkt_type_t 
     }
 
     // Extract source MAC address (addr2 = transmitter)
-    uint8_t *mac = hdr->addr2;
+    const uint8_t *mac = hdr->addr2;
 
     // Filter broadcast/multicast
     if (mac[0] & 0x01) {
